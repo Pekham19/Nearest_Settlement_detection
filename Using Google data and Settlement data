@@ -1,0 +1,161 @@
+// ============================================
+// 1. LOAD UTTARAKHAND
+// ============================================
+
+var india = ee.FeatureCollection("Shape_file_ID");
+
+Map.centerObject(india, 7);
+Map.addLayer(india, {color: 'red'}, 'Uttarakhand');
+
+// ============================================
+// 2. BUILDINGS
+// ============================================
+
+var buildings = ee.FeatureCollection('GOOGLE/Research/open-buildings/v3/polygons')
+                  .filterBounds(india)
+                  .filter(ee.Filter.gt('confidence', 0.65));
+
+Map.addLayer(buildings.limit(3000), {color:'green'}, 'Buildings');
+
+// ============================================
+// 3. LAKES
+// ============================================
+
+var lakes = ee.FeatureCollection("Glacier/Anything_lat_long_shape_file_ID")
+              .filterBounds(india);
+
+Map.addLayer(lakes, {color:'blue'}, 'Lakes');
+
+// ============================================
+// 4. SETTLEMENT DETECTION (DENSE CLUSTER METHOD)
+// ============================================
+
+var results = lakes.map(function(lake){
+
+  var lakeGeom = lake.geometry();
+  var lakeCentroid = lakeGeom.centroid();
+
+  // 🔥 large search area
+  var nearby = buildings.filterBounds(lakeGeom.buffer(15000));
+
+  var totalCount = nearby.size();
+
+  // --------------------------------------------
+  // CREATE GRID FOR CLUSTERING
+  // --------------------------------------------
+
+  var grid = ee.Image.pixelLonLat()
+    .multiply(1000).toInt();  // coarse grid
+
+  var clustered = nearby.map(function(f){
+    var coords = f.geometry().centroid().coordinates();
+    var x = ee.Number(coords.get(0)).multiply(100).toInt();
+    var y = ee.Number(coords.get(1)).multiply(100).toInt();
+    return f.set('cluster_id', x.format().cat('_').cat(y.format()));
+  });
+
+  // --------------------------------------------
+  // GROUP BY CLUSTER
+  // --------------------------------------------
+
+  var clusterStats = clustered
+    .reduceColumns({
+      selectors: ['cluster_id'],
+      reducer: ee.Reducer.frequencyHistogram()
+    });
+
+  var histogram = ee.Dictionary(clusterStats.get('histogram'));
+
+  var keys = histogram.keys();
+  var values = histogram.values();
+
+  var maxClusterSize = ee.Number(values.reduce(ee.Reducer.max()));
+
+  var bestClusterID = keys.get(
+    values.indexOf(maxClusterSize)
+  );
+
+  // --------------------------------------------
+  // GET BEST CLUSTER
+  // --------------------------------------------
+
+  var bestCluster = clustered.filter(ee.Filter.eq('cluster_id', bestClusterID));
+
+  var clusterCount = bestCluster.size();
+
+  var isSettlement = clusterCount.gte(5);
+
+  var centroid = ee.Algorithms.If(
+    isSettlement,
+    bestCluster.geometry().centroid(),
+    null
+  );
+
+  var sett_lon = ee.Algorithms.If(
+    isSettlement,
+    ee.Number(ee.Geometry(centroid).coordinates().get(0)),
+    null
+  );
+
+  var sett_lat = ee.Algorithms.If(
+    isSettlement,
+    ee.Number(ee.Geometry(centroid).coordinates().get(1)),
+    null
+  );
+
+  var dist = ee.Algorithms.If(
+    isSettlement,
+    lakeCentroid.distance(ee.Geometry(centroid)),
+    null
+  );
+
+  return ee.Feature(lakeGeom, {
+    lake_lat: lakeCentroid.coordinates().get(1),
+    lake_lon: lakeCentroid.coordinates().get(0),
+    sett_lat: sett_lat,
+    sett_lon: sett_lon,
+    distance_m: dist,
+    total_buildings: totalCount,
+    cluster_buildings: clusterCount,
+    is_settlement: isSettlement
+  });
+
+});
+
+// ============================================
+// 5. VISUALIZATION
+// ============================================
+
+var lines = results
+  .filter(ee.Filter.notNull(['sett_lat', 'sett_lon']))
+  .map(function(f){
+
+    var lakePoint = ee.Geometry.Point([
+      f.get('lake_lon'),
+      f.get('lake_lat')
+    ]);
+
+    var settPoint = ee.Geometry.Point([
+      f.get('sett_lon'),
+      f.get('sett_lat')
+    ]);
+
+    return ee.Feature(
+      ee.Geometry.LineString([
+        lakePoint.coordinates(),
+        settPoint.coordinates()
+      ])
+    );
+  });
+
+Map.addLayer(lines, {color:'white'}, 'Lake → Settlement');
+
+// ============================================
+// 6. EXPORT
+// ============================================
+
+Export.table.toDrive({
+  collection: results,
+  description: 'Uttarakhand_Settlements_DENSE_CLUSTER',
+  fileFormat: 'CSV'
+});
